@@ -2,7 +2,7 @@
 
 Use in place of :class:`~strands.models.bedrock.BedrockModel` when the target model does not
 support Converse (Custom Model Import, etc.). Request format auto-detects from the model id:
-``anthropic.*``/``*claude*`` use the Anthropic Messages API, everything else uses the OpenAI
+ids containing ``anthropic`` or ``claude`` use the Anthropic Messages API, everything else uses the OpenAI
 Chat Completions API. Ids belonging to a foundation-model family with its own native InvokeModel
 body shape (``amazon.*``, ``meta.*``, ``mistral.*``, ``cohere.*``, ``ai21.*``) are rejected rather
 than guessed — reach for :class:`~strands.models.bedrock.BedrockModel`, which serves them over
@@ -15,7 +15,10 @@ import json
 import logging
 import threading
 import time
+import warnings
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping
+from contextlib import closing
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypeVar, cast
 
@@ -28,14 +31,14 @@ from typing_extensions import Unpack, override
 from .._exception_notes import add_exception_note
 from ..event_loop import streaming
 from ..tools import convert_pydantic_to_tool_spec
-from ..types.content import Messages, SystemContentBlock
+from ..types.content import ContentBlock, Messages, SystemContentBlock
 from ..types.event_loop import Usage
 from ..types.streaming import ReasoningContentBlockDelta, StreamEvent
 from ..types.tools import ToolChoice, ToolSpec
 from ._defaults import resolve_config_metadata
-from ._validation import validate_config_keys
+from ._validation import _warn_on_deprecated_cache_tools, validate_config_keys
 from .bedrock import BedrockModel, _next_stream_event, _poll_cancel_signal, _suppress_task_exception
-from .model import BaseModelConfig, Model
+from .model import BaseModelConfig, CacheConfig, CacheToolsConfig, Model
 
 logger = logging.getLogger(__name__)
 
@@ -193,9 +196,13 @@ class _OpenAIBlockWriter:
 class BedrockInvokeModel(BedrockModel):
     """AWS Bedrock model provider using ``InvokeModel`` / ``InvokeModelWithResponseStream``.
 
-    Subclasses :class:`~strands.models.bedrock.BedrockModel`, matching the shape of other
-    provider-family subclasses (e.g. ``SageMakerAIModel(OpenAIModel)``), while replacing request
-    formatting, streaming, and response translation to talk to the native InvokeModel APIs.
+    Use this provider for imported models that accept OpenAI Chat Completions requests or for
+    Anthropic Messages features available through InvokeModel. Set ``model_family`` explicitly
+    when an ARN does not identify its request dialect. Prefer :class:`BedrockModel` for Converse,
+    integrated Bedrock guardrails, and other foundation-model request formats.
+
+    Prompt-cache configuration is supported for the Anthropic dialect. Tool results accept text
+    only; images are supported only in Anthropic messages. Guardrail configuration is unsupported.
     """
 
     class BedrockInvokeConfig(BaseModelConfig, total=False):
@@ -216,9 +223,17 @@ class BedrockInvokeModel(BedrockModel):
                 request.
             stop_sequences: Sequences that end generation, sent as ``stop_sequences`` on the anthropic
                 family and ``stop`` on the openai family.
+            cache_config: Anthropic prompt caching, using the same system, tools, and last-user-message
+                cache boundaries and TTL rules as ``BedrockModel``.
+            cache_prompt: Deprecated system cache-point type; use ``cache_config`` or an explicit cache point.
+            cache_tools: Deprecated tool cache-point type/configuration; use ``CacheConfig(tools_ttl=...)``.
             params: Extra wire fields, splatted onto the formatted request last, so it both reaches
                 fields this config does not model (``thinking``, ``anthropic_beta``, ...) and overrides
                 computed fields except the OpenAI ``stream``/``stream_options`` transport invariants.
+                Anthropic thinking is omitted when the effective tool choice forces tool use,
+                including structured output, because Bedrock rejects that combination.
+                Set ``stream_options`` to ``None`` to omit the OpenAI usage request for endpoints
+                that do not accept that field.
         """
 
         model_id: str
@@ -229,6 +244,9 @@ class BedrockInvokeModel(BedrockModel):
         top_p: float | None
         top_k: int | None
         stop_sequences: list[str] | None
+        cache_config: CacheConfig | None
+        cache_prompt: str | None
+        cache_tools: str | CacheToolsConfig | None
         params: dict[str, Any] | None
 
     # ``BedrockModel.__init__`` is deliberately not called: it would create a second bedrock-runtime
@@ -241,7 +259,7 @@ class BedrockInvokeModel(BedrockModel):
         region_name: str | None = None,
         endpoint_url: str | None = None,
         **model_config: Unpack[BedrockInvokeConfig],
-    ):
+    ) -> None:
         """Initialize the provider. ``boto_session`` and ``region_name`` are mutually exclusive."""
         self.client, resolved_region = self._create_bedrock_runtime_client(
             boto_session=boto_session,
@@ -251,6 +269,7 @@ class BedrockInvokeModel(BedrockModel):
         )
 
         validate_config_keys(model_config, self.BedrockInvokeConfig)
+        _warn_on_deprecated_cache_tools(model_config, stacklevel=3)
 
         config: BedrockInvokeModel.BedrockInvokeConfig = {
             "model_id": self._get_default_model_with_warning(resolved_region, model_config),
@@ -266,6 +285,7 @@ class BedrockInvokeModel(BedrockModel):
     def update_config(self, **model_config: Unpack[BedrockInvokeConfig]) -> None:  # type: ignore[override]
         """Update the model configuration."""
         validate_config_keys(model_config, self.BedrockInvokeConfig)
+        _warn_on_deprecated_cache_tools(model_config, stacklevel=3)
         self.config.update(model_config)
 
     @override
@@ -295,6 +315,16 @@ class BedrockInvokeModel(BedrockModel):
             )
         return "openai"
 
+    @property
+    @override
+    def _cache_strategy(self) -> str | None:
+        cache_config = self.config.get("cache_config")
+        if cache_config is None:
+            return None
+        if cache_config.strategy == "auto":
+            return "anthropic" if self._get_model_family() == "anthropic" else None
+        return cache_config.strategy
+
     # ----- request formatting
 
     @staticmethod
@@ -303,7 +333,77 @@ class BedrockInvokeModel(BedrockModel):
 
     @staticmethod
     def _system_text(blocks: list[SystemContentBlock] | None) -> str:
-        return " ".join(b.get("text", "") for b in (blocks or []) if "text" in b)
+        text_parts = []
+        for block in blocks or []:
+            if "text" not in block:
+                raise _unsupported_block(block)
+            text_parts.append(block["text"])
+        return " ".join(text_parts)
+
+    @staticmethod
+    def _cache_control(point: Mapping[str, Any]) -> dict[str, Any]:
+        if point.get("type", "default") != "default":
+            raise ValueError("Anthropic prompt caching supports only cache-point type 'default'.")
+        control = {"type": "ephemeral"}
+        if ttl := point.get("ttl"):
+            control["ttl"] = ttl
+        return control
+
+    @classmethod
+    def _attach_cache_point(cls, content: list[dict[str, Any]], point: Mapping[str, Any]) -> None:
+        """Translate a Strands boundary onto the preceding cacheable Anthropic block."""
+        control = cls._cache_control(point)
+        for block in reversed(content):
+            if block.get("type") in ("text", "image", "tool_use", "tool_result"):
+                block["cache_control"] = control
+                return
+        raise ValueError("A cache point must follow cacheable content.")
+
+    @staticmethod
+    def _order_anthropic_user_blocks(blocks: list[ContentBlock]) -> list[ContentBlock]:
+        """Put tool results first without moving content across a cache boundary."""
+        ordered: list[ContentBlock] = []
+        segment: list[ContentBlock] = []
+        cached_non_tool = False
+        for block in blocks:
+            if "cachePoint" in block:
+                ordered.extend(sorted(segment, key=lambda entry: "toolResult" not in entry))
+                ordered.append(block)
+                cached_non_tool |= any("toolResult" not in entry for entry in segment)
+                segment = []
+            else:
+                if "toolResult" in block and cached_non_tool:
+                    raise ValueError(
+                        "Anthropic tool results must precede other user content without crossing a cache boundary. "
+                        "Place tool results before the cached prefix."
+                    )
+                segment.append(block)
+        ordered.extend(sorted(segment, key=lambda entry: "toolResult" not in entry))
+        return ordered
+
+    def _format_anthropic_system(
+        self, blocks: list[SystemContentBlock] | None, tools_cache_point: list[dict[str, Any]]
+    ) -> str | list[dict[str, Any]]:
+        system_blocks = deepcopy(blocks or [])
+        if cache_prompt := self.config.get("cache_prompt"):
+            warnings.warn(
+                "cache_prompt is deprecated. Use SystemContentBlock with cachePoint instead.", UserWarning, stacklevel=3
+            )
+            system_blocks.append({"cachePoint": {"type": cache_prompt}})
+        if self._should_cache_system(system_blocks):
+            system_blocks.append({"cachePoint": {"type": "default"}})
+        system_blocks = self._apply_system_cache_ttl(system_blocks, tools_cache_point)
+        if not any("cachePoint" in block for block in system_blocks):
+            return self._system_text(system_blocks)
+        formatted: list[dict[str, Any]] = []
+        for block in system_blocks:
+            if "text" in block:
+                formatted.append({"type": "text", "text": block["text"]})
+            elif "cachePoint" in block:
+                self._attach_cache_point(formatted, block["cachePoint"])
+            else:
+                raise _unsupported_block(block)
+        return formatted
 
     def _max_tokens(self) -> int:
         """Return the configured generation cap, falling back to the default when unset or ``None``."""
@@ -340,6 +440,7 @@ class BedrockInvokeModel(BedrockModel):
         tool_specs: list[ToolSpec] | None,
         system_prompt_content: list[SystemContentBlock] | None,
         tool_choice: ToolChoice | None,
+        dynamic_trailing_blocks: int = 0,
     ) -> dict[str, Any]:
         """Build an Anthropic Messages request body.
 
@@ -351,12 +452,17 @@ class BedrockInvokeModel(BedrockModel):
             "max_tokens": self._max_tokens(),
             "messages": [],
         }
-        if system := self._system_text(system_prompt_content):
+        tools_cache_point = self._build_tools_cache_point() if tool_specs else []
+        if system := self._format_anthropic_system(system_prompt_content, tools_cache_point):
             request["system"] = system
 
+        if self._cache_strategy == "anthropic":
+            messages = deepcopy(messages)
+            self._inject_cache_point(cast(list[dict[str, Any]], messages), dynamic_trailing_blocks)
         for msg in messages:
             content: list[dict[str, Any]] = []
-            for block in msg["content"]:
+            blocks = self._order_anthropic_user_blocks(msg["content"]) if msg["role"] == "user" else msg["content"]
+            for block in blocks:
                 if "text" in block:
                     content.append({"type": "text", "text": block["text"]})
                 elif "image" in block:
@@ -392,6 +498,8 @@ class BedrockInvokeModel(BedrockModel):
                         content.append({"type": "redacted_thinking", "data": data})
                     else:
                         raise _unsupported_block(block)
+                elif "cachePoint" in block:
+                    self._attach_cache_point(content, block["cachePoint"])
                 else:
                     raise _unsupported_block(block)
             if content:
@@ -402,11 +510,16 @@ class BedrockInvokeModel(BedrockModel):
                 {"name": s["name"], "description": s["description"], "input_schema": s["inputSchema"]["json"]}
                 for s in tool_specs
             ]
+            if tools_cache_point:
+                request["tools"][-1]["cache_control"] = self._cache_control(tools_cache_point[0]["cachePoint"])
         if (tc := self._to_tool_choice(tool_choice, "anthropic")) is not None:
             request["tool_choice"] = tc
 
         self._apply_sampling_params(request, "stop_sequences", include_top_k=True)
         request.update(self.config.get("params") or {})
+        if (request.get("tool_choice") or {}).get("type") in ("any", "tool"):
+            # Bedrock disallows thinking when tool use is forced, including for structured output.
+            request.pop("thinking", None)
         return request
 
     def _format_openai_request(
@@ -423,6 +536,8 @@ class BedrockInvokeModel(BedrockModel):
                 image support on this path; images are formattable only when the target model understands
                 Anthropic Messages format, in which case set ``model_family="anthropic"``.
         """
+        if self.config.get("cache_config") or self.config.get("cache_prompt") or self.config.get("cache_tools"):
+            raise ValueError("Prompt-cache configuration is supported only for the Anthropic request dialect.")
         request: dict[str, Any] = {
             "model": self.config["model_id"],
             "messages": [],
@@ -453,6 +568,7 @@ class BedrockInvokeModel(BedrockModel):
                     tool_results.append({"role": "tool", "tool_call_id": tr["toolUseId"], "content": "".join(chunks)})
                 else:
                     raise _unsupported_block(block)
+            request["messages"].extend(tool_results)
             if tool_calls or text_parts:
                 entry: dict[str, Any] = {"role": msg["role"]}
                 if text_parts:
@@ -461,7 +577,6 @@ class BedrockInvokeModel(BedrockModel):
                     entry["tool_calls"] = tool_calls
                     entry.setdefault("content", None)
                 request["messages"].append(entry)
-            request["messages"].extend(tool_results)
 
         if tool_specs:
             request["tools"] = [
@@ -483,6 +598,8 @@ class BedrockInvokeModel(BedrockModel):
         request["stream"] = self.config.get("streaming", True)
         if request["stream"]:
             request.setdefault("stream_options", {"include_usage": True})
+            if request["stream_options"] is None:
+                request.pop("stream_options")
         else:
             request.pop("stream_options", None)
         return request
@@ -493,9 +610,12 @@ class BedrockInvokeModel(BedrockModel):
         tool_specs: list[ToolSpec] | None,
         system_prompt_content: list[SystemContentBlock] | None,
         tool_choice: ToolChoice | None,
+        dynamic_trailing_blocks: int = 0,
     ) -> dict[str, Any]:
         if self._get_model_family() == "anthropic":
-            return self._format_anthropic_request(messages, tool_specs, system_prompt_content, tool_choice)
+            return self._format_anthropic_request(
+                messages, tool_specs, system_prompt_content, tool_choice, dynamic_trailing_blocks
+            )
         return self._format_openai_request(messages, tool_specs, system_prompt_content, tool_choice)
 
     # ----- response translation
@@ -537,9 +657,6 @@ class BedrockInvokeModel(BedrockModel):
 
         for event in body:
             if cancel_signal is not None and cancel_signal.is_set():
-                # Closing from this thread only: botocore's teardown is not safe against a read in
-                # flight, and this thread is the one reading.
-                body.close()
                 return
             chunk = json.loads(event["chunk"]["bytes"])
             t = chunk.get("type")
@@ -585,6 +702,8 @@ class BedrockInvokeModel(BedrockModel):
                 cache_write = u.get("cache_creation_input_tokens", cache_write)
             # message_stop carries no payload of interest.
 
+        if stop_reason is None:
+            raise ValueError("Anthropic stream ended without a stop reason.")
         if active is not None:
             callback(_BLOCK_STOP)
         callback({"messageStop": {"stopReason": self._map_anthropic_stop(stop_reason)}})
@@ -610,9 +729,6 @@ class BedrockInvokeModel(BedrockModel):
 
         for event in body:
             if cancel_signal is not None and cancel_signal.is_set():
-                # Closing from this thread only: botocore's teardown is not safe against a read in
-                # flight, and this thread is the one reading.
-                body.close()
                 return
             chunk = json.loads(event["chunk"]["bytes"])
             if choices := chunk.get("choices"):
@@ -626,6 +742,8 @@ class BedrockInvokeModel(BedrockModel):
             if chunk.get("usage"):
                 usage = chunk["usage"]
 
+        if stop_reason is None:
+            raise ValueError("OpenAI stream ended without a stop reason.")
         writer.close()
         callback({"messageStop": {"stopReason": self._map_openai_stop(stop_reason)}})
         inp = usage.get("prompt_tokens", 0)
@@ -779,6 +897,7 @@ class BedrockInvokeModel(BedrockModel):
         tool_choice: ToolChoice | None = None,
         system_prompt_content: list[SystemContentBlock] | None = None,
         cancel_signal: threading.Event | None = None,
+        dynamic_trailing_blocks: int = 0,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Stream a turn through Bedrock InvokeModel.
@@ -792,6 +911,8 @@ class BedrockInvokeModel(BedrockModel):
             cancel_signal: Event that aborts an in-flight streaming request. The caller stops receiving
                 events as soon as it is set, and the response is closed at the next chunk boundary. A
                 non-streaming request (``streaming=False``) is not abortable.
+            dynamic_trailing_blocks: Number of trailing blocks in the last user message rebuilt per call.
+                Automatically placed Anthropic cache points precede these blocks.
             **kwargs: Additional keyword arguments for future extensibility.
 
         Yields:
@@ -800,8 +921,10 @@ class BedrockInvokeModel(BedrockModel):
         Raises:
             ContextWindowOverflowException: If the input exceeds the model's context window.
             ModelThrottledException: If the model service is throttling requests.
+            TypeError: If a message or system prompt contains an unsupported content block.
             ValueError: If the model id belongs to a foundation-model family whose native InvokeModel
                 body shape this provider does not send, and no ``model_family`` override is configured.
+                Also raised if a streaming response ends without a model stop reason.
         """
 
         def callback(event: StreamEvent | None = None) -> None:
@@ -815,19 +938,26 @@ class BedrockInvokeModel(BedrockModel):
             system_prompt_content = [{"text": system_prompt}]
 
         thread = asyncio.to_thread(
-            self._stream, callback, messages, tool_specs, system_prompt_content, tool_choice, worker_cancel_signal
+            self._stream,
+            callback,
+            messages,
+            tool_specs,
+            system_prompt_content,
+            tool_choice,
+            worker_cancel_signal,
+            dynamic_trailing_blocks,
         )
         task = asyncio.create_task(thread)
         cancel_poll = asyncio.ensure_future(_poll_cancel_signal(cancel_signal)) if cancel_signal else None
 
         try:
-            while True:
+            while not worker_cancel_signal.is_set():
                 event = await _next_stream_event(queue, cancel_poll)
-                if event is None:
+                if event is None or worker_cancel_signal.is_set():
                     break
                 yield event
 
-            if cancel_poll is not None and cancel_poll.done():
+            if worker_cancel_signal.is_set() or (cancel_poll is not None and cancel_poll.done()):
                 # The worker thread owns the event stream and closes it at its next chunk boundary.
                 # Detaching it rather than awaiting keeps a stalled read from delaying the caller.
                 worker_cancel_signal.set()
@@ -852,11 +982,14 @@ class BedrockInvokeModel(BedrockModel):
         system_prompt_content: list[SystemContentBlock] | None,
         tool_choice: ToolChoice | None,
         cancel_signal: _CancellationSignal | None = None,
+        dynamic_trailing_blocks: int = 0,
     ) -> None:
         """Run the InvokeModel call on a worker thread and stream events."""
         try:
             family = self._get_model_family()
-            request = self._format_invoke_request(messages, tool_specs, system_prompt_content, tool_choice)
+            request = self._format_invoke_request(
+                messages, tool_specs, system_prompt_content, tool_choice, dynamic_trailing_blocks
+            )
             logger.debug("family=<%s> request=<%s>", family, request)
 
             common_kwargs = {
@@ -870,10 +1003,13 @@ class BedrockInvokeModel(BedrockModel):
             if self.config.get("streaming", True):
                 response = self.client.invoke_model_with_response_stream(**common_kwargs)
                 stream_emit = self._emit_anthropic_chunks if family == "anthropic" else self._emit_openai_chunks
-                stream_emit(response["body"], callback, start_time, cancel_signal)
+                # The reading thread owns teardown, including cancellation and translation failures.
+                with closing(response["body"]) as body:
+                    stream_emit(body, callback, start_time, cancel_signal)
             else:
                 response = self.client.invoke_model(**common_kwargs)
-                body = json.loads(response["body"].read())
+                with closing(response["body"]) as response_body:
+                    body = json.loads(response_body.read())
                 logger.debug("response_body=<%s>", body)
                 non_stream_emit = (
                     self._emit_anthropic_non_streaming if family == "anthropic" else self._emit_openai_non_streaming
@@ -918,10 +1054,13 @@ class BedrockInvokeModel(BedrockModel):
         )
 
         last: dict[str, Any] | None = None
-        async for event in streaming.process_stream(response):
+        cancel_signal = kwargs.get("cancel_signal")
+        async for event in streaming.process_stream(response, cancel_signal=cancel_signal):
             last = event
             yield event
 
+        if cancel_signal is not None and cancel_signal.is_set():
+            return
         if last is None or "stop" not in last:
             raise ValueError("Stream ended without a stop event.")
         stop_reason, message, _, _ = last["stop"]
