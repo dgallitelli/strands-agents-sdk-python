@@ -5,40 +5,50 @@ with WebSocket connections, voice activity detection, and function calling.
 """
 
 import asyncio
+import base64
+import copy
 import json
 import logging
 import os
 import time
 import uuid
 from collections.abc import AsyncGenerator
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import websockets
+from typing_extensions import Unpack, override
 from websockets import ClientConnection
 
-from ....types._events import ToolResultEvent, ToolUseStreamEvent
-from ....types.content import Messages
-from ....types.tools import ToolResult, ToolSpec, ToolUse
+from ....types._events import ToolUseStreamEvent
+from ....types.content import Messages, TextBlock
+from ....types.media import ImageBlock
+from ....types.tools import ToolResultBlock, ToolSpec, ToolUse
 from .._async import stop_all
+from ..types.content import BidiContentBlock, BidiContentDelta
 from ..types.events import (
-    AudioSampleRate,
-    BidiAudioInputEvent,
     BidiAudioStreamEvent,
     BidiConnectionStartEvent,
-    BidiImageInputEvent,
-    BidiInputEvent,
     BidiInterruptionEvent,
     BidiOutputEvent,
     BidiResponseCompleteEvent,
     BidiResponseStartEvent,
-    BidiTextInputEvent,
+    BidiTranscriptCompleteEvent,
     BidiTranscriptStreamEvent,
     BidiUsageEvent,
     ModalityUsage,
     Role,
     StopReason,
 )
-from ..types.model import AudioConfig, BidiConnectionConfig
+from ..types.media import AudioDelta
+from .configs import (
+    AudioConfig,
+    AudioStreamConfig,
+    BidiConnectionConfig,
+    BidiModelConfig,
+    _merge_config,
+    _validate_audio_config,
+    _validate_model_config,
+)
 from .model import AudioCapable, BidiModel, BidiModelTimeoutError
 
 logger = logging.getLogger(__name__)
@@ -77,7 +87,7 @@ DEFAULT_SESSION_CONFIG = {
                 "silence_duration_ms": 500,
             },
         },
-        "output": {"format": {"type": "audio/pcm", "rate": DEFAULT_SAMPLE_RATE}, "voice": "alloy"},
+        "output": {"format": {"type": "audio/pcm", "rate": DEFAULT_SAMPLE_RATE}},
     },
 }
 
@@ -103,112 +113,115 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
 
     def __init__(
         self,
-        model_id: str = DEFAULT_MODEL,
-        provider_config: dict[str, Any] | None = None,
-        client_config: dict[str, Any] | None = None,
-        **kwargs: Any,
+        *,
+        api_key: str | None = None,
+        organization: str | None = None,
+        project: str | None = None,
+        timeout_s: int = OPENAI_MAX_TIMEOUT_S,
+        voice: str = "alloy",
+        **model_config: Unpack[BidiModelConfig],
     ) -> None:
         """Initialize OpenAI Realtime bidirectional model.
 
         Args:
-            model_id: Model identifier (default: gpt-realtime)
-            provider_config: Model behavior (audio, instructions, turn_detection, etc.)
-            client_config: Authentication (api_key, organization, project)
-                Falls back to OPENAI_API_KEY, OPENAI_ORGANIZATION, OPENAI_PROJECT env vars
-            **kwargs: Reserved for future parameters.
+            api_key: OpenAI API key. Defaults to ``OPENAI_API_KEY``.
+            organization: OpenAI organization. Defaults to ``OPENAI_ORGANIZATION``.
+            project: OpenAI project. Defaults to ``OPENAI_PROJECT``.
+            timeout_s: Maximum connection duration in seconds.
+            voice: Output voice identifier. Defaults to ``alloy``.
+            **model_config: Model configuration.
 
+        Raises:
+            ValueError: If the API key is missing, ``timeout_s`` exceeds the maximum,
+                or audio formats are unsupported.
         """
-        # Store model ID
-        self.model_id = model_id
+        _validate_model_config(model_config)
+        self._config = BidiModelConfig(**model_config)
+        self._config.setdefault("model_id", DEFAULT_MODEL)
+        self._config["params"] = dict(self._config.get("params") or {})
 
         # OpenAI reports per-response token usage on response.done, not cumulative session totals.
         self.usage_is_cumulative = False
 
-        # Resolve client config with defaults and env vars
-        self._client_config = self._resolve_client_config(client_config or {})
-
-        # Resolve provider config with defaults
-        self.config = self._resolve_provider_config(provider_config or {})
-
-        # Store client config values for later use
-        self.api_key = self._client_config["api_key"]
-        self.organization = self._client_config.get("organization")
-        self.project = self._client_config.get("project")
-        self.timeout_s = self._client_config["timeout_s"]
-
-        if self.timeout_s > OPENAI_MAX_TIMEOUT_S:
+        self.api_key = api_key if api_key is not None else os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
             raise ValueError(
-                f"timeout_s=<{self.timeout_s}>, max_timeout_s=<{OPENAI_MAX_TIMEOUT_S}> | timeout exceeds max limit"
+                "OpenAI API key is required. Provide via api_key or set OPENAI_API_KEY environment variable."
+            )
+
+        self.organization = organization if organization is not None else os.getenv("OPENAI_ORGANIZATION")
+        self.project = project if project is not None else os.getenv("OPENAI_PROJECT")
+        self.timeout_s = timeout_s
+        if timeout_s > OPENAI_MAX_TIMEOUT_S:
+            raise ValueError(
+                f"timeout_s=<{timeout_s}>, max_timeout_s=<{OPENAI_MAX_TIMEOUT_S}> | timeout exceeds max limit"
             )
 
         # OpenAI emits no approaching-limit warning, so reconnect proactively a margin below the
         # reader's reactive timeout: the swap can then align to a turn boundary before the reactive
-        # path fires. Deriving from timeout_s keeps that headroom even when a caller lowers it.
-        # Tunable via provider_config["connection"], e.g. to lower restart_after_s for tests.
-        default_connection: BidiConnectionConfig = {
-            "restart_after_s": self.timeout_s - OPENAI_PROACTIVE_RECONNECT_MARGIN_S
-        }
-        self.connection_config = cast(
-            BidiConnectionConfig, {**default_connection, **(provider_config or {}).get("connection", {})}
+        # path fires. Deriving from timeout_s keeps that headroom when a caller lowers it.
+        self._config["connection"] = BidiConnectionConfig(
+            **{
+                "restart_after_s": timeout_s - OPENAI_PROACTIVE_RECONNECT_MARGIN_S,
+                **self._config.get("connection", {}),
+            }
         )
+
+        self._voice = voice
+        self._resolve_audio_config(self._config.get("params"))
 
         # Connection state (initialized in start())
         self._connection_id: str | None = None
 
         self._function_call_buffer: dict[str, Any] = {}
 
-        logger.debug("model=<%s> | openai realtime model initialized", model_id)
+        logger.debug("model=<%s> | openai realtime model initialized", self._config["model_id"])
 
-    def _resolve_client_config(self, config: dict[str, Any]) -> dict[str, Any]:
-        """Resolve client config with env var fallback (config takes precedence)."""
-        resolved = config.copy()
+    @override
+    def update_config(self, **model_config: Unpack[BidiModelConfig]) -> None:  # type: ignore[override]
+        """Update the model configuration with the provided arguments.
 
-        if "api_key" not in resolved:
-            resolved["api_key"] = os.getenv("OPENAI_API_KEY")
+        Args:
+            **model_config: Configuration overrides.
 
-        if not resolved.get("api_key"):
-            raise ValueError(
-                "OpenAI API key is required. Provide via client_config={'api_key': '...'} "
-                "or set OPENAI_API_KEY environment variable."
-            )
-        if "organization" not in resolved:
-            env_org = os.getenv("OPENAI_ORGANIZATION")
-            if env_org:
-                resolved["organization"] = env_org
+        Raises:
+            ValueError: If the configured audio formats are unsupported.
+        """
+        _validate_model_config(model_config)
+        if "params" in model_config:
+            self._resolve_audio_config(model_config["params"])
+        self._config.update(model_config)
 
-        if "project" not in resolved:
-            env_project = os.getenv("OPENAI_PROJECT")
-            if env_project:
-                resolved["project"] = env_project
+    @override
+    def get_config(self) -> BidiModelConfig:
+        """Return the model configuration by reference."""
+        return self._config
 
-        if "timeout_s" not in resolved:
-            resolved["timeout_s"] = OPENAI_MAX_TIMEOUT_S
-
-        return resolved
-
-    def _resolve_provider_config(self, config: dict[str, Any]) -> dict[str, Any]:
-        """Merge user config with defaults (user takes precedence)."""
-        default_audio: AudioConfig = {
-            "input_rate": cast(AudioSampleRate, DEFAULT_SAMPLE_RATE),
-            "output_rate": cast(AudioSampleRate, DEFAULT_SAMPLE_RATE),
-            "channels": 1,
-            "format": "pcm",
-            "voice": "alloy",
-        }
-
-        resolved = {
-            "audio": {
-                **default_audio,
-                **config.get("audio", {}),
-            },
-            "inference": config.get("inference", {}),
-        }
-        return resolved
-
-    @property
-    def audio_config(self) -> AudioConfig:
+    @override
+    def get_audio_config(self) -> AudioConfig:
         """Get the resolved audio configuration."""
-        return cast(AudioConfig, self.config["audio"])
+        return self._audio_config
+
+    def _resolve_audio_config(self, params: dict[str, Any] | None) -> None:
+        """Resolve audio settings and validate native format overrides."""
+        audio = (params or {}).get("audio", {})
+        for direction in ("input", "output"):
+            stream = audio.get(direction, {})
+            audio_format = stream.get("format", {})
+
+            format_type = audio_format.get("type", "audio/pcm")
+            if format_type != "audio/pcm":
+                raise ValueError(f"Unsupported audio format: {format_type}. Expected audio/pcm.")
+
+            sample_rate = audio_format.get("rate", DEFAULT_SAMPLE_RATE)
+            if sample_rate != DEFAULT_SAMPLE_RATE:
+                raise ValueError(f"Unsupported sample rate: {sample_rate}. Expected {DEFAULT_SAMPLE_RATE}.")
+
+        self._audio_config = AudioConfig(
+            input=AudioStreamConfig(sample_rate=DEFAULT_SAMPLE_RATE, channels=1, format="pcm"),
+            output=AudioStreamConfig(sample_rate=DEFAULT_SAMPLE_RATE, channels=1, format="pcm"),
+        )
+        _validate_audio_config(self._audio_config)
 
     async def start(
         self,
@@ -237,7 +250,7 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         self._function_call_buffer = {}
 
         # Establish WebSocket connection
-        url = f"{OPENAI_REALTIME_URL}?model={self.model_id}"
+        url = f"{OPENAI_REALTIME_URL}?model={self._config['model_id']}"
 
         headers = [("Authorization", f"Bearer {self.api_key}")]
         if self.organization:
@@ -256,20 +269,11 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         if messages:
             await self._add_conversation_history(messages)
 
-    def _create_text_event(self, text: str, role: str, is_final: bool = True) -> BidiTranscriptStreamEvent:
-        """Create standardized transcript event.
-
-        Args:
-            text: The transcript text
-            role: The raw provider role (normalized by the event constructor)
-            is_final: Whether this is the final transcript
-        """
+    def _create_text_event(self, text: str, role: str) -> BidiTranscriptStreamEvent:
+        """Create an incremental transcript event."""
         return BidiTranscriptStreamEvent(
-            delta={"text": text},
-            text=text,
+            delta=text,
             role=cast(Role, role),
-            is_final=is_final,
-            current_transcript=text if is_final else None,
         )
 
     def _create_voice_activity_event(self, activity_type: str) -> BidiInterruptionEvent | None:
@@ -281,8 +285,11 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         return None
 
     def _build_session_config(self, system_prompt: str | None, tools: list[ToolSpec] | None) -> dict[str, Any]:
-        """Build session configuration for OpenAI Realtime API."""
-        config: dict[str, Any] = DEFAULT_SESSION_CONFIG.copy()
+        """Build session configuration for OpenAI Realtime API.
+
+        Model params recursively override defaults and directly supplied options.
+        """
+        config: dict[str, Any] = copy.deepcopy(DEFAULT_SESSION_CONFIG)
 
         if system_prompt:
             config["instructions"] = system_prompt
@@ -290,34 +297,9 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         if tools:
             config["tools"] = self._convert_tools_to_openai_format(tools)
 
-        # Apply user-provided session configuration
-        supported_params = {
-            "max_output_tokens",
-            "output_modalities",
-            "tool_choice",
-        }
-        for key, value in self.config["inference"].items():
-            if key in supported_params:
-                config[key] = value
-            else:
-                logger.warning("parameter=<%s> | ignoring unsupported session parameter", key)
+        config["audio"]["output"]["voice"] = self._voice
 
-        audio_config = self.config["audio"]
-
-        if "voice" in audio_config:
-            config.setdefault("audio", {}).setdefault("output", {})["voice"] = audio_config["voice"]
-
-        if "input_rate" in audio_config:
-            config.setdefault("audio", {}).setdefault("input", {}).setdefault("format", {})["rate"] = audio_config[
-                "input_rate"
-            ]
-
-        if "output_rate" in audio_config:
-            config.setdefault("audio", {}).setdefault("output", {}).setdefault("format", {})["rate"] = audio_config[
-                "output_rate"
-            ]
-
-        return config
+        return _merge_config(config, self._config.get("params") or {})
 
     def _convert_tools_to_openai_format(self, tools: list[ToolSpec]) -> list[dict]:
         """Convert Strands tool specifications to OpenAI Realtime API format."""
@@ -453,7 +435,7 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         if not self._connection_id:
             raise RuntimeError("model not started | call start before receiving")
 
-        yield BidiConnectionStartEvent(connection_id=self._connection_id, model=self.model_id)
+        yield BidiConnectionStartEvent(connection_id=self._connection_id, model=self._config["model_id"])
 
         # Bind this reader to the connection it started on. After a reconnect swaps self._websocket,
         # a still-draining superseded reader keeps reading its own (now-closed) socket rather than
@@ -489,49 +471,35 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         # Audio output
         elif event_type == "response.output_audio.delta":
             # Audio is already base64 string from OpenAI
-            # Use the resolved output sample rate from our merged configuration
-            sample_rate = self.config["audio"]["output_rate"]
-
-            # Channels from config is guaranteed to be 1 or 2
-            channels = cast(Literal[1, 2], self.config["audio"]["channels"])
             return [
                 BidiAudioStreamEvent(
                     audio=openai_event["delta"],
-                    format="pcm",
-                    sample_rate=sample_rate,
-                    channels=channels,
+                    **self._audio_config["output"],
                 )
             ]
 
-        # Assistant text output events - combine multiple similar events
-        elif event_type in ["response.output_text.delta", "response.output_audio_transcript.delta"]:
-            role = openai_event.get("role", "assistant")
-            return [self._create_text_event(openai_event["delta"], role, is_final=False)]
+        # Assistant transcript
+        elif event_type in ("response.output_text.delta", "response.output_audio_transcript.delta"):
+            text = openai_event.get("delta", "")
+            return [self._create_text_event(text, "assistant")] if text else None
 
-        elif event_type in ["response.output_audio_transcript.done"]:
-            role = openai_event.get("role", "assistant")
-            return [self._create_text_event(openai_event["transcript"], role)]
+        elif event_type in ("response.output_text.done", "response.output_audio_transcript.done"):
+            text_key = "text" if event_type == "response.output_text.done" else "transcript"
+            return [BidiTranscriptCompleteEvent(openai_event[text_key], "assistant")]
 
-        elif event_type in ["response.output_text.done"]:
-            role = openai_event.get("role", "assistant")
-            return [self._create_text_event(openai_event["text"], role)]
+        # User transcript
+        elif event_type == "conversation.item.input_audio_transcription.delta":
+            text = openai_event.get("delta", "")
+            return [self._create_text_event(text, "user")] if text else None
 
-        # User transcription events - combine multiple similar events
-        elif event_type in [
-            "conversation.item.input_audio_transcription.delta",
-            "conversation.item.input_audio_transcription.completed",
-        ]:
-            text_key = "delta" if "delta" in event_type else "transcript"
-            text = openai_event.get(text_key, "")
-            role = openai_event.get("role", "user")
-            is_final = "completed" in event_type
-            return [self._create_text_event(text, role, is_final=is_final)] if text.strip() else None
+        elif event_type == "conversation.item.input_audio_transcription.completed":
+            return [BidiTranscriptCompleteEvent(openai_event["transcript"], "user")]
 
         elif event_type == "conversation.item.input_audio_transcription.segment":
             segment_data = openai_event.get("segment", {})
             text = segment_data.get("text", "")
             role = segment_data.get("role", "user")
-            return [self._create_text_event(text, role)] if text.strip() else None
+            return [self._create_text_event(text, role)] if text else None
 
         elif event_type == "conversation.item.input_audio_transcription.failed":
             error_info = openai_event.get("error", {})
@@ -735,14 +703,14 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
 
     async def send(
         self,
-        content: BidiInputEvent | ToolResultEvent,
+        content: BidiContentBlock | BidiContentDelta | ToolResultBlock,
     ) -> None:
         """Unified send method for all content types. Sends the given content to OpenAI.
 
         Dispatches to appropriate internal handler based on content type.
 
         Args:
-            content: Typed event (BidiTextInputEvent, BidiAudioInputEvent, BidiImageInputEvent, or ToolResultEvent).
+            content: A TextBlock, AudioDelta, ImageBlock, or ToolResultBlock.
 
         Raises:
             ValueError: If content type not supported.
@@ -750,34 +718,36 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         if not self._connection_id:
             raise RuntimeError("model not started | call start before sending")
 
-        # Note: TypedEvent inherits from dict, so isinstance checks for TypedEvent must come first
-        if isinstance(content, BidiTextInputEvent):
+        if isinstance(content, TextBlock):
             await self._send_text_content(content.text)
-        elif isinstance(content, BidiAudioInputEvent):
+        elif isinstance(content, AudioDelta):
             await self._send_audio_content(content)
-        elif isinstance(content, BidiImageInputEvent):
+        elif isinstance(content, ImageBlock):
             await self._send_image_content(content)
-        elif isinstance(content, ToolResultEvent):
-            tool_result = content.get("tool_result")
-            if tool_result:
-                await self._send_tool_result(tool_result)
+        elif isinstance(content, ToolResultBlock):
+            await self._send_tool_result(content)
         else:
             raise ValueError(f"content_type={type(content)} | content not supported")
 
-    async def _send_audio_content(self, audio_input: BidiAudioInputEvent) -> None:
+    async def _send_audio_content(self, audio_input: AudioDelta) -> None:
         """Internal: Send audio content to OpenAI for processing."""
-        # Audio is already base64 encoded in the event
-        await self._send_event({"type": "input_audio_buffer.append", "audio": audio_input.audio})
+        audio_bytes = audio_input.source.get("bytes")
+        if audio_bytes is None:
+            raise ValueError("audio source must contain bytes for OpenAI Realtime")
+        audio = base64.b64encode(audio_bytes).decode("utf-8")
+        await self._send_event({"type": "input_audio_buffer.append", "audio": audio})
 
-    async def _send_image_content(self, image_input: BidiImageInputEvent) -> None:
+    async def _send_image_content(self, image_input: ImageBlock) -> None:
         """Internal: Send image content to OpenAI for processing.
 
-        Sends the image as an ``input_image`` content block on a user message via
-        ``conversation.item.create``. Image data is encoded as a ``data:`` URL using
-        the event's MIME type and base64 payload, matching the format documented for
-        OpenAI's Realtime API image input on ``gpt-realtime`` models.
+        Image data is encoded as a ``data:`` URL using the image format and base64
+        payload, matching OpenAI's Realtime API image input format.
         """
-        data_url = f"data:{image_input.mime_type};base64,{image_input.image}"
+        image_bytes = image_input.source.get("bytes")
+        if image_bytes is None:
+            raise ValueError("image source must contain bytes for OpenAI Realtime")
+        image = base64.b64encode(image_bytes).decode("utf-8")
+        data_url = f"data:image/{image_input.format};base64,{image}"
         item_data = {
             "type": "message",
             "role": "user",
@@ -791,26 +761,23 @@ class OpenAIRealtimeModel(BidiModel, AudioCapable):
         await self._send_event({"type": "conversation.item.create", "item": item_data})
         await self._send_event({"type": "response.create"})
 
-    async def _send_tool_result(self, tool_result: ToolResult) -> None:
+    async def _send_tool_result(self, tool_result: ToolResultBlock) -> None:
         """Internal: Send tool result back to OpenAI."""
-        tool_use_id = tool_result.get("toolUseId")
+        tool_use_id = tool_result.tool_use_id
 
         logger.debug("tool_use_id=<%s> | sending openai tool result", tool_use_id)
 
         # Validate content types and serialize, preserving structure
-        result_output = ""
-        if "content" in tool_result:
-            # First validate all content types are supported
-            for block in tool_result["content"]:
-                if "text" not in block and "json" not in block:
-                    # Unsupported content type - raise error
-                    raise ValueError(
-                        f"tool_use_id=<{tool_use_id}>, content_types=<{list(block.keys())}> | "
-                        f"Content type not supported by OpenAI Realtime API"
-                    )
+        for block in tool_result.content:
+            if "text" not in block and "json" not in block:
+                # Unsupported content type - raise error
+                raise ValueError(
+                    f"tool_use_id=<{tool_use_id}>, content_types=<{list(block.keys())}> | "
+                    f"Content type not supported by OpenAI Realtime API"
+                )
 
-            # Preserve structure by JSON-dumping the entire content array
-            result_output = json.dumps(tool_result["content"])
+        # Preserve structure by JSON-dumping the entire content array
+        result_output = json.dumps(tool_result.content)
 
         item_data = {"type": "function_call_output", "call_id": tool_use_id, "output": result_output}
         await self._send_event({"type": "conversation.item.create", "item": item_data})

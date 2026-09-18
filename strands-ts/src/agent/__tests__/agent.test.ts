@@ -22,6 +22,7 @@ import {
   VideoBlock,
   DocumentBlock,
 } from '../../index.js'
+import type { InvokeOptions } from '../../index.js'
 import { AgentPrinter } from '../printer.js'
 import {
   AfterInvocationEvent,
@@ -36,6 +37,9 @@ import { StructuredOutputError } from '../../errors.js'
 import { expectLoopMetrics } from '../../__fixtures__/metrics-helpers.js'
 import { expectAgentResult } from '../../__fixtures__/agent-helpers.js'
 import { anyTrackingId } from '../../__fixtures__/message-helpers.js'
+import type { StreamOptions } from '../../index.js'
+import type { ModelStreamEvent } from '../../models/streaming.js'
+import { InMemoryStorage } from '../../storage/in-memory-storage.js'
 
 describe('Agent', () => {
   describe('stream', () => {
@@ -2366,6 +2370,18 @@ describe('normalizeToolUseNames', () => {
       })
     })
 
+    describe('when a limit key is unrecognized', () => {
+      // Guards #4354: a mistyped cap name is rejected instead of silently applying no limit.
+      it.each([
+        ['maxTurns', { limits: { maxTurns: 3 } }],
+        ['turn', { limits: { turn: 3 } }],
+        ['a typo alongside a valid cap', { limits: { turns: 3, maxTokens: 100 } }],
+      ])('rejects %s with TypeError', async (_label, options) => {
+        const agent = new Agent({ model: new MockMessageModel().addTurn({ type: 'textBlock', text: 'never reached' }) })
+        await expect(agent.invoke('go', options as InvokeOptions)).rejects.toThrow(/not recognized/)
+      })
+    })
+
     describe('when invoked via stream()', () => {
       it('returns limitTurns as the generator return value', async () => {
         const model = new MockMessageModel()
@@ -2404,6 +2420,58 @@ describe('normalizeToolUseNames', () => {
       const agent = new Agent({ model: new MockMessageModel(), sessionManager })
 
       expect(agent.sessionId).toBe('my-session')
+    })
+  })
+
+  describe('agentMetadata', () => {
+    class RecordingModel extends MockMessageModel {
+      readonly receivedOptions: StreamOptions[] = []
+
+      override async *stream(messages: Message[], options?: StreamOptions): AsyncGenerator<ModelStreamEvent> {
+        this.receivedOptions.push(options ?? {})
+        yield* super.stream(messages, options)
+      }
+    }
+
+    it('forwards the session id to the model when a session manager is attached', async () => {
+      const model = new RecordingModel().addTurn({ type: 'textBlock', text: 'ok' })
+      const sessionManager = new SessionManager({ sessionId: 'my-session', storage: new InMemoryStorage() })
+      const agent = new Agent({ model, sessionManager, printer: false })
+
+      await agent.invoke('hi')
+
+      expect(model.receivedOptions[0]?.agentMetadata).toEqual({ sessionId: 'my-session' })
+    })
+
+    it('sends no agent metadata when no session manager is attached', async () => {
+      const model = new RecordingModel().addTurn({ type: 'textBlock', text: 'ok' })
+      const agent = new Agent({ model, printer: false })
+
+      await agent.invoke('hi')
+
+      expect(model.receivedOptions).toHaveLength(1)
+      expect(model.receivedOptions[0]?.agentMetadata).toBeUndefined()
+    })
+
+    it('routes each agent on its own session when one model is shared across sessions', async () => {
+      // Guards against the cross-session cache bleed a construction-time key fill would introduce.
+      const model = new RecordingModel().addTurn({ type: 'textBlock', text: 'ok' })
+      const agentS1 = new Agent({
+        model,
+        sessionManager: new SessionManager({ sessionId: 's1', storage: new InMemoryStorage() }),
+        printer: false,
+      })
+      const agentS2 = new Agent({
+        model,
+        sessionManager: new SessionManager({ sessionId: 's2', storage: new InMemoryStorage() }),
+        printer: false,
+      })
+
+      await agentS1.invoke('hi')
+      await agentS2.invoke('hi')
+
+      const sessionIds = model.receivedOptions.map((options) => options.agentMetadata?.sessionId)
+      expect(sessionIds).toEqual(['s1', 's2'])
     })
   })
 })

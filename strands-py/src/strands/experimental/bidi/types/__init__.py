@@ -1,51 +1,55 @@
 """Type definitions for bidirectional streaming."""
 
 from .agent import BidiAgentInput
+from .content import BidiContentBlock, BidiContentBlockData, BidiContentDelta, BidiContentDeltaData
 from .events import (
-    BidiAudioInputEvent,
+    AudioChannel,
+    AudioFormat,
     BidiAudioStreamEvent,
     BidiConnectionCloseEvent,
     BidiConnectionRestartEvent,
     BidiConnectionStartEvent,
     BidiConnectionWarningEvent,
     BidiErrorEvent,
-    BidiImageInputEvent,
-    BidiInputEvent,
     BidiInterruptionEvent,
     BidiOutputEvent,
     BidiResponseCompleteEvent,
     BidiResponseStartEvent,
-    BidiTextInputEvent,
+    BidiTranscriptCompleteEvent,
     BidiTranscriptStreamEvent,
     BidiUsageEvent,
     ModalityUsage,
+    Role,
+    StopReason,
 )
 from .io import BidiInput, BidiOutput
-from .model import BidiConnectionConfig
+from .media import AudioDelta
 
 __all__ = [
+    "AudioChannel",
+    "AudioDelta",
+    "AudioFormat",
+    "BidiAgentInput",
+    "BidiContentBlock",
+    "BidiContentBlockData",
+    "BidiContentDelta",
+    "BidiContentDeltaData",
     "BidiInput",
     "BidiOutput",
-    "BidiAgentInput",
-    # Input Events
-    "BidiTextInputEvent",
-    "BidiAudioInputEvent",
-    "BidiImageInputEvent",
-    "BidiInputEvent",
-    # Output Events
-    "BidiConnectionStartEvent",
-    "BidiConnectionRestartEvent",
-    "BidiConnectionWarningEvent",
-    "BidiConnectionCloseEvent",
-    "BidiResponseStartEvent",
-    "BidiResponseCompleteEvent",
     "BidiAudioStreamEvent",
-    "BidiTranscriptStreamEvent",
+    "BidiConnectionCloseEvent",
+    "BidiConnectionRestartEvent",
+    "BidiConnectionStartEvent",
+    "BidiConnectionWarningEvent",
+    "BidiErrorEvent",
     "BidiInterruptionEvent",
+    "BidiOutputEvent",
+    "BidiResponseCompleteEvent",
+    "BidiResponseStartEvent",
+    "BidiTranscriptCompleteEvent",
+    "BidiTranscriptStreamEvent",
     "BidiUsageEvent",
     "ModalityUsage",
-    "BidiErrorEvent",
-    "BidiOutputEvent",
-    # Reconnect configuration
-    "BidiConnectionConfig",
+    "Role",
+    "StopReason",
 ]

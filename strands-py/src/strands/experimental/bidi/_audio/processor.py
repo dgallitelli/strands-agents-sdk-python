@@ -11,12 +11,12 @@ import queue
 
 import numpy as np
 import numpy.typing as npt
-from pywebrtc_audio import AudioProcessor
+import pywebrtc_audio
 
 logger = logging.getLogger(__name__)
 
 
-class _BidiAudioProcessor:
+class AudioProcessor:
     """Coordinate WebRTC microphone processing with playback reference audio.
 
     Buffers played audio for echo cancellation and processes microphone audio with aligned playback frames.
@@ -57,22 +57,31 @@ class _BidiAudioProcessor:
         self._far_buffer_size = far_buffer_size
         self._far_buffer: queue.Queue[bytes] | None = None
 
-    def start(self, *, input_rate: int, output_rate: int, num_channels: int) -> None:
+    def start(self, *, input_rate: int, output_rate: int | None = None, num_channels: int) -> None:
         """Initialize the native processor for an audio session.
 
         Args:
             input_rate: Microphone sample rate in Hz.
                 Must be supported by pywebrtc-audio.
             output_rate: Speaker sample rate in Hz.
+                Required when echo cancellation is enabled.
                 Reference audio is resampled to input_rate when the rates differ.
             num_channels: Number of audio channels.
+                Only mono (1) is supported.
 
         Raises:
             ValueError: If the audio format is invalid.
         """
+        if num_channels != 1:
+            raise ValueError(
+                f"Audio processing currently supports only mono audio (num_channels=1), received {num_channels}"
+            )
+        if self._echo_cancellation and output_rate is None:
+            raise ValueError("Echo cancellation requires output_rate")
+
         self._input_rate = input_rate
         self._output_rate = output_rate
-        self._processor = AudioProcessor(
+        self._processor = pywebrtc_audio.AudioProcessor(
             sample_rate=input_rate,
             num_channels=num_channels,
             echo_cancellation=self._echo_cancellation,
@@ -82,7 +91,7 @@ class _BidiAudioProcessor:
         )
         self._far_buffer = queue.Queue[bytes](self._far_buffer_size or 0) if self._echo_cancellation else None
         logger.debug(
-            "input_rate=<%d>, output_rate=<%d>, channels=<%d> | audio processor initialized",
+            "input_rate=<%d>, output_rate=<%s>, channels=<%d> | audio processor initialized",
             input_rate,
             output_rate,
             num_channels,
@@ -154,7 +163,7 @@ class _BidiAudioProcessor:
 
         Returns samples unchanged when rates match.
         """
-        if self._output_rate == self._input_rate:
+        if self._output_rate is None or self._output_rate == self._input_rate:
             return samples
 
         if len(samples) == 0:

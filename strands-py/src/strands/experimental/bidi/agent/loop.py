@@ -15,35 +15,36 @@ from opentelemetry.trace import Span
 
 from ....telemetry.tracer import get_tracer
 from ....types._events import ToolInterruptEvent, ToolResultEvent, ToolResultMessageEvent, ToolUseStreamEvent
-from ....types.content import Message
-from ....types.tools import ToolResult, ToolUse
-from ...hooks.events import (
-    BidiAfterConnectionRestartEvent,
-    BidiAfterInvocationEvent,
-    BidiBeforeConnectionRestartEvent,
-    BidiBeforeInvocationEvent,
-)
-from ...hooks.events import (
-    BidiInterruptionEvent as BidiInterruptionHookEvent,
-)
+from ....types.content import Message, TextBlock
+from ....types.tools import ToolResult, ToolResultBlock, ToolUse
 from .. import _telemetry
 from .._async import _TaskPool, stop_all
+from ..hooks.events import (
+    BidiAfterConnectionRestartEvent,
+    BidiAgentStopEvent,
+    BidiBeforeConnectionRestartEvent,
+)
+from ..hooks.events import (
+    BidiInterruptionEvent as BidiInterruptionHookEvent,
+)
+from ..hooks.events import (
+    BidiResponseCompleteEvent as BidiResponseCompleteHookEvent,
+)
 from ..models import BidiModelTimeoutError, Restartable
+from ..types.content import BidiContentBlock, BidiContentDelta
 from ..types.events import (
     BidiAudioStreamEvent,
     BidiConnectionCloseEvent,
     BidiConnectionRestartEvent,
     BidiConnectionWarningEvent,
-    BidiInputEvent,
     BidiInterruptionEvent,
     BidiOutputEvent,
     BidiResponseCompleteEvent,
     BidiResponseStartEvent,
-    BidiTextInputEvent,
+    BidiTranscriptCompleteEvent,
     BidiTranscriptStreamEvent,
     BidiUsageEvent,
 )
-from ..types.model import BidiConnectionConfig
 from ._reconnect_timer import BidiReconnectTimer, resolve_deadline_s
 
 if TYPE_CHECKING:
@@ -154,8 +155,6 @@ class _BidiAgentLoop:
             raise RuntimeError("loop already started | call stop before starting again")
 
         logger.debug("agent loop starting")
-        await self._agent.hooks.invoke_callbacks_async(BidiBeforeInvocationEvent(agent=self._agent))
-
         model_id = getattr(self._agent.model, "model_id", None)
 
         self._session_span = _telemetry.start_session_span(
@@ -189,7 +188,7 @@ class _BidiAgentLoop:
         self._task_pool = _TaskPool()
         self._model_task = self._task_pool.create(self._run_model(self._generation))
 
-        self._invocation_state = invocation_state or {}
+        self._invocation_state = invocation_state if invocation_state is not None else {}
         self._send_gate.set()
         self._started = True
 
@@ -227,15 +226,15 @@ class _BidiAgentLoop:
                 )
                 self._session_span = None
 
-            await self._agent.hooks.invoke_callbacks_async(BidiAfterInvocationEvent(agent=self._agent))
+            await self._agent.hooks.invoke_callbacks_async(BidiAgentStopEvent(agent=self._agent))
 
-    async def send(self, event: BidiInputEvent | ToolResultEvent) -> None:
-        """Send model event.
+    async def send(self, content: BidiContentBlock | BidiContentDelta | ToolResultBlock) -> None:
+        """Send user input or a tool result to the model.
 
-        Additionally, add text input to messages array.
+        Text input is also added to the conversation history.
 
         Args:
-            event: User input event or tool result.
+            content: User input or tool result to send.
 
         Raises:
             RuntimeError: If start has not been called.
@@ -247,17 +246,16 @@ class _BidiAgentLoop:
             logger.debug("waiting for model send signal")
             await self._send_gate.wait()
 
-        if isinstance(event, BidiTextInputEvent):
-            message: Message = {"role": event.role, "content": [{"text": event.text}]}
+        if isinstance(content, TextBlock):
+            message: Message = {"role": "user", "content": [{"text": content.text}]}
             await self._agent._append_messages(message)
-            if event.role == "user":
-                # A user text turn owes a response, same as a finished audio turn. Mark it so a
-                # proactive reconnect waits for the reply instead of swapping mid-turn; without
-                # this, a text-driven session always looks idle and the turn can be cut.
-                self._awaiting_response = True
-                self._update_turn_state()
+            # A user text turn owes a response, same as a finished audio turn. Mark it so a
+            # proactive reconnect waits for the reply instead of swapping mid-turn; without
+            # this, a text-driven session always looks idle and the turn can be cut.
+            self._awaiting_response = True
+            self._update_turn_state()
 
-        await self._agent.model.send(event)
+        await self._agent.model.send(content)
 
     async def receive(self) -> AsyncGenerator[BidiOutputEvent, None]:
         """Receive model and tool call events.
@@ -314,23 +312,13 @@ class _BidiAgentLoop:
 
             yield event
 
-    def _connection_config(self) -> BidiConnectionConfig:
-        """Return the model's declared connection config, or an empty config if none.
-
-        Providers are not required to declare ``connection_config``; a missing or empty
-        config means reactive-only reconnect with no proactive timer.
-        """
-        connection_config = getattr(self._agent.model, "connection_config", None)
-        return cast(BidiConnectionConfig, connection_config) if connection_config else {}
-
     def _auto_reconnect_enabled(self) -> bool:
         """Whether the agent reconnects automatically.
 
         Automatic reconnect is the default: a provider is opted in unless it explicitly
-        declares ``auto_reconnect: False`` in its ``connection_config``. A provider that
-        declares no ``connection_config`` at all is treated as opted in.
+        declares ``auto_reconnect: False`` in its connection config.
         """
-        return self._connection_config().get("auto_reconnect", True)
+        return self._agent.model.get_connection_config().get("auto_reconnect", True)
 
     def _arm_reconnect_timer(self) -> None:
         """Arm the proactive reconnect timer when the model opts in with a declared deadline.
@@ -340,7 +328,7 @@ class _BidiAgentLoop:
         """
         if not self._auto_reconnect_enabled():
             return
-        deadline_s = resolve_deadline_s(self._connection_config())
+        deadline_s = resolve_deadline_s(self._agent.model.get_connection_config())
         if deadline_s is None:
             return
         self._reconnect_timer.arm(deadline_s, _MODEL_RESTART_WARNING_S)
@@ -608,11 +596,6 @@ class _BidiAgentLoop:
             async for event in self._agent.model.receive():
                 if generation != self._generation:
                     return
-                await self._event_queue.put(event)
-                # The put can suspend on the full queue across a reconnect; re-check so a stale
-                # event from the closed connection is not applied to the new connection's state.
-                if generation != self._generation:
-                    return
 
                 if isinstance(event, BidiResponseStartEvent):
                     if response_span:
@@ -649,6 +632,13 @@ class _BidiAgentLoop:
                     # transcript arriving after completion does not re-open the turn.
                     self._awaiting_response = False
                     self._update_turn_state()
+                    await self._agent.hooks.invoke_callbacks_async(
+                        BidiResponseCompleteHookEvent(
+                            agent=self._agent, response_id=event.response_id, stop_reason=event.stop_reason
+                        )
+                    )
+                    if generation != self._generation:
+                        return
 
                 elif isinstance(event, BidiTranscriptStreamEvent):
                     if event["role"] == "user":
@@ -659,18 +649,20 @@ class _BidiAgentLoop:
                         # the final user transcript, and the reply is what clears this state.
                         self._awaiting_response = True
                         self._update_turn_state()
-                    if event["is_final"]:
-                        message: Message = {"role": event["role"], "content": [{"text": event["text"]}]}
-                        await self._agent._append_messages(message)
 
-                elif isinstance(event, ToolUseStreamEvent):
-                    tool_use = event["current_tool_use"]
-                    self._task_pool.create(self._run_tool(tool_use, generation))
+                elif isinstance(event, BidiTranscriptCompleteEvent):
+                    message: Message = {"role": event.role, "content": [{"text": event.transcript}]}
+                    await self._agent._append_messages(message)
+                    if generation != self._generation:
+                        return
 
                 elif isinstance(event, BidiInterruptionEvent):
                     if self._session_span:
                         _telemetry.add_interruption_event(self._session_span, event["reason"])
 
+                    # A barge-in ends the current response; the user's next turn owes a reply.
+                    self._response_active = False
+                    self._update_turn_state()
                     await self._agent.hooks.invoke_callbacks_async(
                         BidiInterruptionHookEvent(
                             agent=self._agent,
@@ -678,12 +670,19 @@ class _BidiAgentLoop:
                             interrupted_response_id=event.get("interrupted_response_id"),
                         )
                     )
-                    # A barge-in ends the current response; the user's next turn owes a reply.
-                    self._response_active = False
-                    self._update_turn_state()
+                    if generation != self._generation:
+                        return
 
                 elif isinstance(event, BidiUsageEvent):
                     self._record_usage(event)
+
+                await self._event_queue.put(event)
+                if generation != self._generation:
+                    return
+
+                if isinstance(event, ToolUseStreamEvent):
+                    tool_use = event["current_tool_use"]
+                    self._task_pool.create(self._run_tool(tool_use, generation))
 
         except Exception as error:
             model_error = error
@@ -718,16 +717,9 @@ class _BidiAgentLoop:
         tool_results: list[ToolResult] = []
 
         # Ensure request_state exists for tools like strands_tools.stop
-        if "request_state" not in self._invocation_state:
-            self._invocation_state["request_state"] = {}
-
-        invocation_state: dict[str, Any] = {
-            **self._invocation_state,
-            "agent": self._agent,
-            "model": self._agent.model,
-            "messages": self._agent.messages,
-            "system_prompt": self._agent.system_prompt,
-        }
+        invocation_state = self._invocation_state
+        if "request_state" not in invocation_state:
+            invocation_state["request_state"] = {}
 
         tool_call_span = self._tracer.start_tool_call_span(tool_use, parent_span=self._session_span)
         tool_result: ToolResult | None = None
@@ -795,7 +787,13 @@ class _BidiAgentLoop:
                 return
 
             # Send result to model
-            await self.send(tool_result_event)
+            await self.send(
+                ToolResultBlock(
+                    tool_use_id=tool_result["toolUseId"],
+                    status=tool_result["status"],
+                    content=tool_result["content"],
+                )
+            )
 
         except Exception as error:
             tool_error = error
