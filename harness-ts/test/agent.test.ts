@@ -129,7 +129,7 @@ describe('createHarness', () => {
       expect(toolNames(agent)).toContain(name)
     }
     expect(agent.systemPrompt).toBe(HARNESS_CONTRACT)
-    expect(conversationManagerName(agent)).toBe('SummarizingConversationManager')
+    expect(agent.contextManager).toBeInstanceOf(ContextManager)
   })
 
   it('attaches a ModelRouter through the model parameter', async () => {
@@ -354,13 +354,14 @@ describe('createHarness', () => {
     expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('has no native web search'))
   })
 
-  it('lets native search win over the Exa fallback', async () => {
+  it('lets an explicit Exa selection win over native search', async () => {
+    // https://github.com/strands-agents/harness-sdk/issues/4480
     const agent = await createHarness({
       model: 'openai/gpt-5.6-sol',
       builtinTools: { web_search: 'exa' },
     })
-    expect(toolNames(agent)).not.toContain('web_search')
-    expect((agent.model.getConfig().params as { tools: unknown }).tools).toEqual([{ type: 'web_search' }])
+    expect(toolNames(agent)).toContain('web_search')
+    expect(agent.model.getConfig().params).not.toHaveProperty('tools')
   })
 
   it('serves the Exa fallback on a Model instance', async () => {
@@ -438,7 +439,7 @@ describe('createHarness', () => {
 
   it('uses the default strategy when contextManager is auto', async () => {
     const agent = await createHarness({ contextManager: 'auto' })
-    expect(conversationManagerName(agent)).toBe('SummarizingConversationManager')
+    expect(agent.contextManager).toBeInstanceOf(ContextManager)
   })
 
   it('disables context management when contextManager is null', async () => {

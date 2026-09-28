@@ -117,7 +117,7 @@ def _metadata(
     usage: Usage = {
         "inputTokens": in_tok,
         "outputTokens": out_tok,
-        "totalTokens": in_tok + out_tok if total is None else total,
+        "totalTokens": in_tok + out_tok + cache_read + cache_write if total is None else total,
     }
     if cache_read:
         usage["cacheReadInputTokens"] = cache_read

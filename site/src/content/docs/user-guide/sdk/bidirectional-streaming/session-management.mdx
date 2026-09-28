@@ -36,7 +36,7 @@ Create a `BidiAgent` with a session manager and use it:
 
 ```python
 from strands.experimental.bidi.agent import BidiAgent
-from strands.experimental.bidi.io import BidiAudioIO
+from strands.experimental.bidi.io import AudioIO
 from strands.experimental.bidi.models import BedrockNovaSonicModel
 from strands.session.file_session_manager import FileSessionManager
 
@@ -44,14 +44,14 @@ from strands.session.file_session_manager import FileSessionManager
 session_manager = FileSessionManager(session_id="user_123_voice_session")
 
 # Create the agent with session management
-model = BedrockNovaSonicModel()
+model = BedrockNovaSonicModel(model_id="amazon.nova-2-sonic-v1:0")
 agent = BidiAgent(
     model=model,
     session_manager=session_manager
 )
 
 # Use the agent - all messages are automatically persisted
-audio_io = BidiAudioIO()
+audio_io = AudioIO()
 await agent.run(
     inputs=[audio_io.input()],
     outputs=[audio_io.output()]
@@ -157,7 +157,7 @@ from strands.session import FileSessionManager
 
 session_manager = FileSessionManager(session_id="user_123", storage_dir="./sessions/")
 agent = BidiAgent(
-    model=BedrockNovaSonicModel(),
+    model=BedrockNovaSonicModel(model_id="amazon.nova-2-sonic-v1:0"),
     agent_id="voice-assistant",
     session_manager=session_manager,
 )
@@ -177,7 +177,7 @@ from strands.session import FileSessionManager
 # First conversation
 session_manager = FileSessionManager(session_id="user_123", storage_dir="./sessions/")
 agent = BidiAgent(
-    model=BedrockNovaSonicModel(),
+    model=BedrockNovaSonicModel(model_id="amazon.nova-2-sonic-v1:0"),
     agent_id="voice-assistant",
     session_manager=session_manager,
 )
@@ -189,7 +189,7 @@ await agent.stop()
 # Later: constructing a new agent restores the saved messages and state.
 session_manager = FileSessionManager(session_id="user_123", storage_dir="./sessions/")
 agent = BidiAgent(
-    model=BedrockNovaSonicModel(),
+    model=BedrockNovaSonicModel(model_id="amazon.nova-2-sonic-v1:0"),
     agent_id="voice-assistant",
     session_manager=session_manager,
 )
@@ -230,7 +230,8 @@ async for event in agent.receive():
         print(f"Reconnecting (reason={event.reason}) with full history preserved")
 ```
 
-For the reconnect timing and how to tune it with `BidiConnectionConfig`, see [Connection Restart](agent.md#connection-restart).
+For reconnect timing and how to tune it with `ConnectionConfig`, see
+[Connection Restart](agent.md#connection-restart).
 
 ## Integration with Hooks
 

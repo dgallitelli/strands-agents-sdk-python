@@ -22,6 +22,7 @@ from strands.event_loop import streaming
 from strands.models.bedrock import DEFAULT_BEDROCK_MODEL_ID, BedrockModel
 from strands.models.bedrock_invoke import BedrockInvokeModel
 from strands.models.model import CacheConfig, CacheToolsConfig, Model
+from strands.telemetry.metrics import EventLoopMetrics
 from strands.types.exceptions import ContextWindowOverflowException, ModelThrottledException
 from strands.types.streaming import StreamEvent
 
@@ -841,6 +842,7 @@ async def test_stream_anthropic_redacted_reasoning_round_trips(bedrock_client):
 
 @pytest.mark.asyncio
 async def test_stream_anthropic_reports_cache_usage(bedrock_client):
+    """Include cached prompt tokens in usage and context size (#1217)."""
     bedrock_client.invoke_model_with_response_stream.return_value = {
         "body": _chunks(
             [
@@ -864,10 +866,16 @@ async def test_stream_anthropic_reports_cache_usage(bedrock_client):
     events = await _collect(BedrockInvokeModel(model_id=CLAUDE_ID), [{"role": "user", "content": [{"text": "hi"}]}])
 
     tru_usage = _metadata(events)["usage"]
+    metrics = EventLoopMetrics()
+    metrics.reset_usage_metrics()
+    metrics.start_cycle(attributes={"event_loop_cycle_id": "cache-stream"})
+    metrics.update_usage(tru_usage)
+    assert metrics.latest_context_size == 155
+    assert metrics.projected_context_size == 158
     exp_usage = {
         "inputTokens": 5,
         "outputTokens": 3,
-        "totalTokens": 8,
+        "totalTokens": 158,
         "cacheReadInputTokens": 100,
         "cacheWriteInputTokens": 50,
     }
@@ -1303,6 +1311,7 @@ async def test_stream_non_streaming_anthropic_redacted_reasoning(bedrock_client)
 
 @pytest.mark.asyncio
 async def test_stream_non_streaming_anthropic_reports_cache_usage(bedrock_client):
+    """Include cached prompt tokens in usage and context size (#1217)."""
     body = unittest.mock.Mock()
     body.read.return_value = json.dumps(
         {
@@ -1324,10 +1333,16 @@ async def test_stream_non_streaming_anthropic_reports_cache_usage(bedrock_client
     )
 
     tru_usage = _metadata(events)["usage"]
+    metrics = EventLoopMetrics()
+    metrics.reset_usage_metrics()
+    metrics.start_cycle(attributes={"event_loop_cycle_id": "cache-response"})
+    metrics.update_usage(tru_usage)
+    assert metrics.latest_context_size == 154
+    assert metrics.projected_context_size == 160
     exp_usage = {
         "inputTokens": 4,
         "outputTokens": 6,
-        "totalTokens": 10,
+        "totalTokens": 160,
         "cacheReadInputTokens": 100,
         "cacheWriteInputTokens": 50,
     }
