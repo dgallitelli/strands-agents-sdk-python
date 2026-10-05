@@ -325,16 +325,32 @@ def test_format_anthropic_request_image_media_type(model):
     assert image["source"]["media_type"] == "image/png"
 
 
-def test_format_anthropic_request_tool_use_and_result(model):
-    tu = {"toolUseId": "tu1", "name": "weather", "input": {"city": "Paris"}}
+@pytest.mark.parametrize(
+    "tool_input, expected_input",
+    [
+        (None, {}),
+        ("", {}),
+        (0, {}),
+        (False, {}),
+        ([], {}),
+        ("invalid", {}),
+        (["value"], {}),
+        ({}, {}),
+        ({"city": "Paris"}, {"city": "Paris"}),
+    ],
+)
+def test_format_anthropic_request_tool_use_and_result(model, tool_input, expected_input):
+    tu = {"toolUseId": "tu1", "name": "weather", "input": tool_input}
     tr = {"toolUseId": "tu1", "status": "error", "content": [{"text": "boom"}]}
     msgs = [
         {"role": "assistant", "content": [{"toolUse": tu}]},
         {"role": "user", "content": [{"toolResult": tr}]},
     ]
+    original_messages = deepcopy(msgs)
     req = model._format_anthropic_request(msgs, None, None, None)
-    expected = {"type": "tool_use", "id": "tu1", "name": "weather", "input": tu["input"]}
+    expected = {"type": "tool_use", "id": "tu1", "name": "weather", "input": expected_input}
     assert req["messages"][0]["content"][0] == expected
+    assert msgs == original_messages
     user = req["messages"][1]["content"][0]
     assert user["type"] == "tool_result"
     assert user["tool_use_id"] == "tu1"
@@ -465,18 +481,34 @@ def test_format_openai_request_basic():
     assert req["messages"][1] == {"role": "user", "content": "Hello"}
 
 
-def test_format_openai_request_tool_calls_and_results():
+@pytest.mark.parametrize(
+    "tool_input, expected_input",
+    [
+        (None, {}),
+        ("", {}),
+        (0, {}),
+        (False, {}),
+        ([], {}),
+        ("invalid", {}),
+        (["value"], {}),
+        ({}, {}),
+        ({"x": 1}, {"x": 1}),
+    ],
+)
+def test_format_openai_request_tool_calls_and_results(tool_input, expected_input):
     m = BedrockInvokeModel(model_id="my-imported-model", model_family="openai")
-    tu = {"toolUseId": "tu1", "name": "fn", "input": {"x": 1}}
+    tu = {"toolUseId": "tu1", "name": "fn", "input": tool_input}
     tr = {"toolUseId": "tu1", "status": "success", "content": [{"text": "ok"}]}
     spec = [{"name": "fn", "description": "d", "inputSchema": {"json": {"type": "object"}}}]
     msgs = [
         {"role": "assistant", "content": [{"toolUse": tu}]},
         {"role": "user", "content": [{"toolResult": tr}]},
     ]
+    original_messages = deepcopy(msgs)
     req = m._format_openai_request(msgs, spec, None, {"tool": {"name": "fn"}})
     fn = req["messages"][0]["tool_calls"][0]["function"]
-    assert fn == {"name": "fn", "arguments": json.dumps({"x": 1})}
+    assert fn == {"name": "fn", "arguments": json.dumps(expected_input)}
+    assert msgs == original_messages
     assert req["messages"][1] == {"role": "tool", "tool_call_id": "tu1", "content": "ok"}
     assert req["tool_choice"] == {"type": "function", "function": {"name": "fn"}}
     assert req["tools"][0]["function"]["parameters"] == {"type": "object"}

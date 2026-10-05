@@ -475,8 +475,14 @@ class BedrockInvokeModel(BedrockModel):
                     content.append({"type": "image", "source": source})
                 elif "toolUse" in block:
                     tu = block["toolUse"]
+                    tool_input = tu.get("input")
                     content.append(
-                        {"type": "tool_use", "id": tu["toolUseId"], "name": tu["name"], "input": tu["input"]}
+                        {
+                            "type": "tool_use",
+                            "id": tu["toolUseId"],
+                            "name": tu["name"],
+                            "input": tool_input if isinstance(tool_input, dict) else {},
+                        }
                     )
                 elif "toolResult" in block:
                     tr = block["toolResult"]
@@ -560,7 +566,11 @@ class BedrockInvokeModel(BedrockModel):
                     text_parts.append(block["text"])
                 elif "toolUse" in block:
                     tu = block["toolUse"]
-                    fn = {"name": tu["name"], "arguments": json.dumps(tu["input"])}
+                    tool_input = tu.get("input")
+                    fn = {
+                        "name": tu["name"],
+                        "arguments": json.dumps(tool_input if isinstance(tool_input, dict) else {}),
+                    }
                     tool_calls.append({"id": tu["toolUseId"], "type": "function", "function": fn})
                 elif "toolResult" in block:
                     tr = block["toolResult"]
