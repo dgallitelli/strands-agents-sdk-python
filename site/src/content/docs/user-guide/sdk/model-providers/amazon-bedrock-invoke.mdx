@@ -89,6 +89,8 @@ selects the request and response dialect; it does not change model capabilities.
 
 Without an override, other IDs fall back to the OpenAI dialect, except IDs starting
 with `amazon.`, `meta.`, `mistral.`, `cohere.`, or `ai21.`, which raise `ValueError`.
+The same guard applies to their cross-Region inference-profile IDs and their
+foundation-model or inference-profile ARNs.
 Those foundation-model families require other native request formats. Use
 `BedrockModel` for Converse access to supported models. Override the dialect only
 when the target accepts it.

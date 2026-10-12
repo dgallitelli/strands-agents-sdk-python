@@ -306,6 +306,14 @@ class BedrockInvokeModel(BedrockModel):
         model_id = self.config["model_id"].lower()
         if "anthropic" in model_id or "claude" in model_id:
             return "anthropic"
+        arn_parts = model_id.split(":", 5)
+        if len(arn_parts) == 6 and arn_parts[0] == "arn" and arn_parts[2] == "bedrock":
+            resource_type, _, resource_id = arn_parts[5].partition("/")
+            if resource_type in ("foundation-model", "inference-profile"):
+                model_id = resource_id
+        prefix, _, unprefixed_id = model_id.partition(".")
+        if prefix in ("us", "eu", "ap", "apac", "global", "us-gov"):
+            model_id = unprefixed_id
         if model_id.startswith(_NATIVE_SCHEMA_MODEL_PREFIXES):
             raise ValueError(
                 f"model_id=<{self.config['model_id']}> | this model family takes its own native "
@@ -918,9 +926,10 @@ class BedrockInvokeModel(BedrockModel):
             system_prompt: System prompt to provide context to the model.
             tool_choice: Selection strategy for tool invocation.
             system_prompt_content: Structured system prompt content blocks.
-            cancel_signal: Event that aborts an in-flight streaming request. The caller stops receiving
-                events as soon as it is set, and the response is closed at the next chunk boundary. A
-                non-streaming request (``streaming=False``) is not abortable.
+            cancel_signal: Event that prevents a cancelled request from starting and aborts an in-flight
+                streaming request. The caller stops receiving events as soon as it is set, and the response
+                is closed at the next chunk boundary. An in-flight non-streaming request
+                (``streaming=False``) is not abortable.
             dynamic_trailing_blocks: Number of trailing blocks in the last user message rebuilt per call.
                 Automatically placed Anthropic cache points precede these blocks.
             **kwargs: Additional keyword arguments for future extensibility.
@@ -936,6 +945,8 @@ class BedrockInvokeModel(BedrockModel):
                 body shape this provider does not send, and no ``model_family`` override is configured.
                 Also raised if a streaming response ends without a model stop reason.
         """
+        if cancel_signal is not None and cancel_signal.is_set():
+            return
 
         def callback(event: StreamEvent | None = None) -> None:
             loop.call_soon_threadsafe(queue.put_nowait, event)
@@ -1008,6 +1019,9 @@ class BedrockInvokeModel(BedrockModel):
                 "contentType": "application/json",
                 "accept": "application/json",
             }
+
+            if cancel_signal is not None and cancel_signal.is_set():
+                return
 
             start_time = time.perf_counter()
             if self.config.get("streaming", True):

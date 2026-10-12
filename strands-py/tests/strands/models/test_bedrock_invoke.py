@@ -31,6 +31,17 @@ CLAUDE_ID = "anthropic.claude-3-5-sonnet-20241022-v2:0"
 IMPORTED_ID = "arn:aws:bedrock:us-east-1:123:imported-model/abc"
 # A foundation-model id whose native InvokeModel body shape this provider does not send.
 NATIVE_SCHEMA_ID = "meta.llama3-1-8b-instruct-v1:0"
+NATIVE_ID_FORMS = [
+    "{}",
+    "us.{}",
+    "eu.{}",
+    "ap.{}",
+    "apac.{}",
+    "global.{}",
+    "arn:aws:bedrock:us-west-2::foundation-model/{}",
+    "arn:aws:bedrock:us-west-2:123:inference-profile/us.{}",
+    "arn:aws-us-gov:bedrock:us-gov-west-1:123:inference-profile/us-gov.{}",
+]
 
 
 @tool
@@ -260,6 +271,8 @@ async def test_count_tokens_ignores_use_native_token_count(bedrock_client):
         ("us.anthropic.claude-3-haiku", "anthropic"),
         (IMPORTED_ID, "openai"),
         ("my-imported-model", "openai"),
+        ("arn:aws:bedrock:us-west-2:123:imported-model/meta.custom", "openai"),
+        ("arn:aws:bedrock:us-west-2:123:application-inference-profile/meta.custom", "openai"),
     ],
 )
 def test_model_family_detection(model_id, expected):
@@ -281,28 +294,34 @@ def test_model_family_override():
         "ai21.jamba-1-5-mini-v1:0",
     ],
 )
-def test_model_family_detection_rejects_native_schema_model(model_id):
+@pytest.mark.parametrize("id_form", NATIVE_ID_FORMS)
+def test_model_family_detection_rejects_native_schema_model(model_id, id_form):
     """A native foundation model takes a body shape this provider does not send, so detection refuses to guess."""
-    m = BedrockInvokeModel(model_id=model_id)
+    # Wrapped identifiers retain their native dialect (#1217, review 3905975242).
+    m = BedrockInvokeModel(model_id=id_form.format(model_id))
     with pytest.raises(ValueError, match="model_family"):
         m._get_model_family()
 
 
 @pytest.mark.parametrize("family", ["anthropic", "openai"])
-def test_model_family_override_allows_native_schema_model(family):
+@pytest.mark.parametrize("id_form", NATIVE_ID_FORMS)
+def test_model_family_override_allows_native_schema_model(family, id_form):
     """An explicit override is an intentional choice, so it wins even over a native-schema model id."""
-    m = BedrockInvokeModel(model_id=NATIVE_SCHEMA_ID, model_family=family)
+    m = BedrockInvokeModel(model_id=id_form.format(NATIVE_SCHEMA_ID), model_family=family)
     assert m._get_model_family() == family
 
 
 @pytest.mark.asyncio
-async def test_stream_native_schema_model_raises_before_invoking(bedrock_client):
+@pytest.mark.parametrize("id_form", NATIVE_ID_FORMS)
+@pytest.mark.parametrize("use_streaming", [False, True])
+async def test_stream_native_schema_model_raises_before_invoking(bedrock_client, id_form, use_streaming):
     """The guard surfaces to the caller rather than sending a body the model cannot parse."""
-    m = BedrockInvokeModel(model_id=NATIVE_SCHEMA_ID)
+    m = BedrockInvokeModel(model_id=id_form.format(NATIVE_SCHEMA_ID), streaming=use_streaming)
     with pytest.raises(ValueError, match="model_family"):
         await _collect(m, [{"role": "user", "content": [{"text": "hi"}]}])
 
     bedrock_client.invoke_model_with_response_stream.assert_not_called()
+    bedrock_client.invoke_model.assert_not_called()
 
 
 # ---- request formatting
@@ -1587,6 +1606,46 @@ async def test_stream_client_error_names_request_body_family(bedrock_client, con
 
 
 # ---- cancellation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_streaming", [False, True])
+async def test_stream_pre_cancelled_request_does_not_start_worker(bedrock_client, alist, use_streaming):
+    # Cancellation before a request starts must not launch generation (#1217, review 3905975251).
+    cancel_signal = threading.Event()
+    cancel_signal.set()
+    model = BedrockInvokeModel(model_id=CLAUDE_ID, streaming=use_streaming)
+    with unittest.mock.patch("strands.models.bedrock_invoke.asyncio.to_thread") as worker:
+        tru_events = await alist(model.stream([], cancel_signal=cancel_signal))
+        await asyncio.sleep(0)
+
+    assert tru_events == []
+    worker.assert_not_called()
+    bedrock_client.invoke_model.assert_not_called()
+    bedrock_client.invoke_model_with_response_stream.assert_not_called()
+
+
+@pytest.mark.parametrize("use_streaming", [False, True])
+def test_stream_cancelled_during_request_formatting_does_not_invoke(bedrock_client, use_streaming):
+    # A cancellation racing with worker preparation must stop before invoking Bedrock (#1217).
+    bedrock_client.invoke_model.side_effect = AssertionError("Cancelled request reached Bedrock")
+    bedrock_client.invoke_model_with_response_stream.side_effect = AssertionError("Cancelled request reached Bedrock")
+    cancel_signal = threading.Event()
+    callback = unittest.mock.Mock()
+    model = BedrockInvokeModel(model_id=CLAUDE_ID, streaming=use_streaming)
+    format_request = model._format_invoke_request
+
+    def cancel_after_formatting(*args):
+        request = format_request(*args)
+        cancel_signal.set()
+        return request
+
+    with unittest.mock.patch.object(model, "_format_invoke_request", side_effect=cancel_after_formatting):
+        model._stream(callback, [], None, None, None, cancel_signal)
+
+    callback.assert_called_once_with()
+    bedrock_client.invoke_model.assert_not_called()
+    bedrock_client.invoke_model_with_response_stream.assert_not_called()
 
 
 def _slow_then_raise(bedrock_client):
